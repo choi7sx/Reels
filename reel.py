@@ -332,6 +332,70 @@ def video_filter(path):
     return ",".join(chain)
 
 
+_silence_cache = {}
+
+
+def silences(src, min_len, thr=None):
+    """Silent stretches in a clip, measured from the audio itself (not Whisper's timings).
+
+    Threshold adapts to the recording: 12 dB under typical speech level, so breaths count as pauses."""
+    import numpy as np
+    key = (src, thr)
+    if key not in _silence_cache:
+        x = load_audio(src)
+        hop = 160  # 10 ms at 16 kHz
+        n = len(x) // hop
+        rms = np.sqrt(np.mean(x[: n * hop].reshape(n, hop) ** 2, axis=1) + 1e-12)
+        db = 20 * np.log10(rms)
+        # smooth over 50 ms so single quiet frames inside words don't count as silence
+        db = np.convolve(db, np.ones(5) / 5, mode="same")
+        floor, speech = np.percentile(db, 10), np.percentile(db, 90)
+        # anything ~12 dB below normal speech (breaths, room tone, lip noise) counts as a pause
+        if thr is None:
+            thr = max(floor + 6.0, speech - 12.0)
+        _silence_cache[("thr", src)] = thr
+        quiet = db < thr
+        # a blip under 100 ms between two quiet stretches (click, breath, bump) is still a pause
+        loud_start = None
+        for i in range(len(quiet)):
+            if not quiet[i] and loud_start is None:
+                loud_start = i
+            elif quiet[i] and loud_start is not None:
+                if i - loud_start <= 10 and loud_start > 0 and quiet[loud_start - 1]:
+                    quiet[loud_start:i] = True
+                loud_start = None
+        runs, start = [], None
+        for i, q in enumerate(np.append(quiet, False)):
+            if q and start is None:
+                start = i
+            elif not q and start is not None:
+                runs.append((start / 100, i / 100))
+                start = None
+        _silence_cache[key] = runs
+    return [r for r in _silence_cache[key] if r[1] - r[0] >= min_len]
+
+
+def tighten(src, start, end, max_sil, pad):
+    """Split [start, end] so no pause longer than max_sil survives; keep `pad` s of air at each cut."""
+    pieces, cur = [], start
+    for s0, s1 in silences(src, max_sil):
+        if s1 <= cur or s0 >= end:
+            continue
+        cut_from, cut_to = max(cur, s0 + pad), min(end, s1 - pad)
+        if s0 <= cur:            # segment starts in silence: just move the start
+            cur = max(cur, cut_to)
+            continue
+        if s1 >= end:            # segment ends in silence: move the end
+            end = cut_from
+            break
+        if cut_to - cut_from > 0.05:
+            pieces.append((cur, cut_from))
+            cur = cut_to
+    if end - cur > 0.08:
+        pieces.append((cur, end))
+    return [p for p in pieces if p[1] - p[0] > 0.08]
+
+
 def cmd_render(a):
     plan = json.loads((WORK / "edit.json").read_text())
     t = json.loads((WORK / "transcript.json").read_text())
@@ -344,9 +408,20 @@ def cmd_render(a):
     seg_dir.mkdir(parents=True)
     OUT.mkdir(exist_ok=True)
 
+    max_sil = a.max_silence if a.max_silence is not None else plan.get("max_silence", 0.25)
+    pieces = []
+    for s in plan["segments"]:
+        src = INPUT / s["clip"]
+        subs = tighten(src, s["start"], s["end"], max_sil, 0.06) if max_sil > 0 else [(s["start"], s["end"])]
+        for j, (st, en) in enumerate(subs):
+            pieces.append({"clip": s["clip"], "start": st, "end": en, "new_phrase": j == 0})
+    before = sum(s["end"] - s["start"] for s in plan["segments"])
+    after = sum(p["end"] - p["start"] for p in pieces)
+    print(f"pause removal: {len(plan['segments'])} phrases -> {len(pieces)} pieces, {before:.1f}s -> {after:.1f}s")
+
     timeline_words, offset, parts = [], 0.0, []
     filters = {}
-    for i, s in enumerate(plan["segments"]):
+    for i, s in enumerate(pieces):
         src = INPUT / s["clip"]
         if src not in filters:
             filters[src] = video_filter(src)
@@ -358,20 +433,27 @@ def cmd_render(a):
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-c:a", "pcm_s16le", "-ar", "48000",
              "-video_track_timescale", "30000", part.with_suffix(".mov")])
         parts.append(part.with_suffix(".mov"))
-        first = True
+        first = s["new_phrase"]
         for w in words_by_clip.get(s["clip"], []):
-            if w["start"] >= s["start"] - 0.05 and w["end"] <= s["end"] + 0.05 and \
-                    not (a.drop_fillers and norm(w["w"]) in FILLERS):
+            mid = (w["start"] + w["end"]) / 2
+            if s["start"] <= mid < s["end"] and not (a.drop_fillers and norm(w["w"]) in FILLERS):
                 timeline_words.append({"w": w["w"], "start": offset + max(0, w["start"] - s["start"]),
                                        "end": offset + min(dur, w["end"] - s["start"]), "cut_before": first})
                 first = False
         # use the real encoded length so captions never drift
         offset += float(probe(parts[-1])["format"]["duration"])
 
+    if max_sil > 0:  # self-check: measure the joined cut with each source's own threshold
+        thr = min(_silence_cache[("thr", INPUT / p["clip"])] for p in pieces)
     concat = seg_dir / "list.txt"
     concat.write_text("".join(f"file '{p.name}'\n" for p in parts))
     joined = WORK / "joined.mov"
     run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", concat, "-c", "copy", joined])
+
+    if max_sil > 0:
+        left = silences(joined, max_sil + 0.05, thr)
+        print(f"pause check: {len(left)} pauses over {max_sil + 0.05:.2f}s left" +
+              (": " + ", ".join(f"{a0:.1f}s ({a1 - a0:.2f}s)" for a0, a1 in left) if left else ""))
 
     ass, srt = build_captions(timeline_words, style, plan.get("hook", ""), plan.get("hook_seconds", 3))
     (WORK / "captions.ass").write_text(ass)
@@ -429,11 +511,14 @@ def main():
     pl = sub.add_parser("plan"); add_plan(pl); pl.set_defaults(fn=cmd_plan)
     r = sub.add_parser("render"); add_render(r)
     r.add_argument("--style", default="", choices=[""] + list(STYLES))
+    r.add_argument("--max-silence", type=float, default=None,
+                   help="cut every pause longer than this many seconds (default 0.25; 0 = off)")
     r.add_argument("--keep-fillers", dest="drop_fillers", action="store_false")
     r.set_defaults(fn=cmd_render)
 
     al = sub.add_parser("all", help="transcribe + plan + render")
     add_transcribe(al); add_plan(al); add_render(al)
+    al.add_argument("--max-silence", type=float, default=None)
 
     def run_all(a):
         cmd_transcribe(a); cmd_plan(a)

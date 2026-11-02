@@ -33,6 +33,9 @@ themselves. Do every step for them, and send the finished video back with SendUs
    - Fix misheard words (names, slang, brand names) by editing the `"w"` values in
      `work/transcript.json`. Captions are built from those words.
 5. **Render**: `python3 reel.py render` → `out/reel.mp4` + `out/captions.srt`.
+   Render measures the real audio and cuts every pause, breath and room-noise gap longer than
+   0.25s (`--max-silence`, or `"max_silence"` in edit.json; 0 = off). It prints a `pause check`
+   line, which should say 0 pauses left. The user wants no dead air between sentences.
 6. **Check**: grab 2–3 frames (`ffmpeg -ss 2 -i out/reel.mp4 -frames:v 1 -vf scale=360:-1 work/f.png`)
    and look at them to make sure captions aren't covering the face and aren't off-screen.
 7. **Deliver**: SendUserFile `out/reel.mp4`, and `out/captions.srt` if they use CapCut.
