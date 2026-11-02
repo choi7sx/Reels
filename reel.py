@@ -320,13 +320,49 @@ def srt_time(t):
     return f"{ms // 3600000:02d}:{ms % 3600000 // 60000:02d}:{ms % 60000 // 1000:02d},{ms % 1000:03d}"
 
 
-def video_filter(path):
-    """Scale/crop to 1080x1920 and tone-map iPhone HDR (HLG/PQ) to normal SDR."""
+# Exposure fixes. Gamma moves the midtones (faces) without blowing out highlights or crushing
+# blacks the way a flat brightness offset would.
+LIGHT = {
+    "none": "",
+    "brighten": "eq=gamma=1.15:saturation=1.03",
+    "brighten_more": "eq=gamma=1.35:saturation=1.06",
+    "darken": "eq=gamma=0.88",
+    "darken_more": "eq=gamma=0.78:contrast=1.04",
+}
+
+
+def measure_luma(path, ranges):
+    """Average brightness (Y, 16-235 scale) over the parts of the clip we keep."""
+    vals = []
+    for st, en in ranges:
+        r = subprocess.run(["ffmpeg", "-v", "info", "-ss", f"{st:.2f}", "-t", f"{max(0.5, en - st):.2f}", "-i", str(path),
+                            "-vf", "fps=2,scale=160:-2,signalstats,metadata=print:key=lavfi.signalstats.YAVG",
+                            "-an", "-f", "null", "-"], capture_output=True, text=True)
+        vals += [float(v) for v in re.findall(r"YAVG=([0-9.]+)", r.stderr)]
+    return sum(vals) / len(vals) if vals else 126.0
+
+
+def pick_light(luma):
+    if luma < 85:
+        return "brighten_more"
+    if luma < 105:
+        return "brighten"
+    if luma > 180:
+        return "darken_more"
+    if luma > 160:
+        return "darken"
+    return "none"
+
+
+def video_filter(path, light="none"):
+    """Scale/crop to 1080x1920, tone-map iPhone HDR (HLG/PQ) to SDR, apply the exposure fix."""
     v = next((s for s in probe(path).get("streams", []) if s.get("codec_type") == "video"), {})
     chain = []
     if v.get("color_transfer") in ("arib-std-b67", "smpte2084"):
         chain.append("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
                      "tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv")
+    if LIGHT.get(light):
+        chain.append(LIGHT[light])
     chain.append(f"scale={W}:{H}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{H}")
     chain.append(f"fps={FPS},setsar=1,format=yuv420p")
     return ",".join(chain)
@@ -335,11 +371,24 @@ def video_filter(path):
 _silence_cache = {}
 
 
-def silences(src, min_len, thr=None):
-    """Silent stretches in a clip, measured from the audio itself (not Whisper's timings).
+def speech_mask(src, x, n):
+    """Per-10ms True where Silero VAD (bundled with faster-whisper) hears speech, padded 50 ms."""
+    import numpy as np
+    from faster_whisper.vad import get_speech_timestamps, VadOptions
+    mask = np.zeros(n, dtype=bool)
+    for t in get_speech_timestamps(x, VadOptions(threshold=0.5, min_silence_duration_ms=100, speech_pad_ms=0)):
+        mask[max(0, t["start"] // 160 - 5): t["end"] // 160 + 5] = True
+    return mask
 
-    Threshold adapts to the recording: 15 dB under typical speech, so breathy gaps between
-    sentences count, but soft word endings don't."""
+
+def silences(src, min_len, thr=None):
+    """Pauses in a clip: stretches that are BOTH quiet (loudness under threshold) AND not speech
+    (according to the VAD). Loudness alone can't tell a breath from a soft word; the VAD alone
+    sometimes misses short words like "but". Requiring both keeps words safe while still
+    catching silence, breaths and room noise.
+
+    Threshold adapts to the recording: 15 dB under typical speech level. Anything 25 dB under
+    is silence regardless (the VAD lingers ~0.3s after speech stops)."""
     import numpy as np
     key = (src, thr)
     if key not in _silence_cache:
@@ -347,15 +396,21 @@ def silences(src, min_len, thr=None):
         hop = 160  # 10 ms at 16 kHz
         n = len(x) // hop
         rms = np.sqrt(np.mean(x[: n * hop].reshape(n, hop) ** 2, axis=1) + 1e-12)
-        db = 20 * np.log10(rms)
+        raw = 20 * np.log10(rms)
         # smooth over 50 ms so single quiet frames inside words don't count as silence
-        db = np.convolve(db, np.ones(5) / 5, mode="same")
+        db = np.convolve(raw, np.ones(5) / 5, mode="same")
         floor, speech = np.percentile(db, 10), np.percentile(db, 90)
         if thr is None:
             thr = max(floor + 6.0, speech - 15.0)
         _silence_cache[("thr", src)] = thr
         _silence_cache[("db", src)] = (db, speech)
-        quiet = db < thr
+        # very quiet (>25 dB under speech) is silence even if the VAD's hangover still says "speech";
+        # the 15-25 dB band (where soft word endings live) only counts if the VAD agrees.
+        quiet = (db < speech - 25.0) | ((db < thr) & ~speech_mask(src, x, n))
+        # hard safety: 30 ms+ of sound within 20 dB of speech is a (possibly soft) word, never silence
+        loud = np.convolve((raw > speech - 20.0).astype(int), np.ones(3, dtype=int), mode="same") >= 3
+        loud = np.convolve(loud.astype(int), np.ones(7, dtype=int), mode="same") > 0  # +-30 ms margin
+        quiet &= ~loud
         runs, start = [], None
         for i, q in enumerate(np.append(quiet, False)):
             if q and start is None:
@@ -367,28 +422,83 @@ def silences(src, min_len, thr=None):
     return [r for r in _silence_cache[key] if r[1] - r[0] >= min_len]
 
 
-def tighten(src, start, end, max_sil, pad):
-    """Split [start, end] so no pause longer than max_sil survives; keep `pad` s of air at each cut."""
-    pieces, cur = [], start
+def tighten(src, start, end, max_sil, pad_after, pad_before, words=()):
+    """Split [start, end] so no pause longer than max_sil survives.
+
+    Keeps `pad_after` s of air after the last word and `pad_before` s before the next one, so a
+    shortened pause becomes a natural beat. Never cuts into a word Whisper is confident about."""
+    # confident, non-stretched words (Whisper sometimes stretches a word across a pause)
+    cores = [(w["start"] + 0.03, w["end"] - 0.03) for w in words
+             if w.get("p", 1) > 0.5 and w["end"] - w["start"] < 0.6]
+    # Phrase edges: trim leading/trailing quiet of any length, so the join between two phrases is
+    # always pad_after + pad_before (a natural ~0.3s beat) instead of two leftovers adding up.
+    start_in_silence = end_in_silence = False
+    for s0, s1 in silences(src, 0.05):
+        if s0 <= start + 0.02 < s1:
+            start, start_in_silence = max(start, s1 - pad_before), True
+        if s0 < end - 0.02 <= s1:
+            end, end_in_silence = min(end, s0 + pad_after), True
+    # An edge set inside measured silence is trusted over Whisper's (often ~0.1s loose) word times.
+    # An edge that lands in sound (a manual mid-sentence cut): keep the word if it's mostly in,
+    # otherwise drop it, so we never leave half a word.
+    for c0, c1 in cores:
+        mid = (c0 + c1) / 2
+        if not start_in_silence and c0 < start < c1:
+            start = max(0.0, c0 - 0.03) if mid >= start else c1 + 0.03
+        if not end_in_silence and c0 < end < c1:
+            end = c1 + 0.03 if mid <= end else c0 - 0.03
+    pieces, cur, cuts = [], start, []
     for s0, s1 in silences(src, max_sil):
         if s1 <= cur or s0 >= end:
             continue
-        cut_from, cut_to = max(cur, s0 + pad), min(end, s1 - pad)
+        cut_from, cut_to = max(cur, s0 + pad_after), min(end, s1 - pad_before)
+        for c0, c1 in cores:  # pull the cut back out of any word it would touch
+            if c0 < cut_to and c1 > cut_from:
+                if c0 - cut_from > cut_to - c1:
+                    cut_to = c0
+                else:
+                    cut_from = c1
+        if cut_to - cut_from < 0.1:
+            continue
         if s0 <= cur:            # segment starts in silence: just move the start
             cur = max(cur, cut_to)
             continue
         if s1 >= end:            # segment ends in silence: move the end
             end = cut_from
             break
-        db, speech = _silence_cache[("db", src)]
-        if db[int(cut_from * 100):int(cut_to * 100)].max(initial=-200) > speech - 20:
-            continue  # something audible (soft word ending) inside: leave this pause alone
-        if cut_to - cut_from > 0.05:
-            pieces.append((cur, cut_from))
-            cur = cut_to
+        pieces.append((cur, cut_from))
+        cuts.append((cut_from, cut_to))
+        cur = cut_to
     if end - cur > 0.08:
         pieces.append((cur, end))
     return [p for p in pieces if p[1] - p[0] > 0.08]
+
+
+def write_storyboard(plan, pieces, lights, total, raw_len, words_by_clip):
+    """A short, human-readable record of the edit: what's kept, where pauses were trimmed, light."""
+    def mmss(t):
+        return f"{int(t // 60)}:{t % 60:04.1f}"
+    rows = []
+    for seg in plan["segments"]:
+        ps = [p for p in pieces if p["seg"] is seg]
+        if not ps:
+            continue
+        kept = sum(p["end"] - p["start"] for p in ps)
+        trimmed = (seg["end"] - seg["start"]) - kept
+        bits = []
+        if len(ps) > 1:
+            bits.append(f"{len(ps) - 1} pause{'s' if len(ps) != 2 else ''} shortened")
+        if trimmed >= 0.05:
+            bits.append(f"-{trimmed:.2f}s dead air")
+        note = ", ".join(bits)
+        text = " ".join(w["w"] for w in words_by_clip.get(seg["clip"], [])
+                        if any(p["start"] <= (w["start"] + w["end"]) / 2 < p["end"] for p in ps)) or seg.get("text", "")
+        rows.append(f"| {mmss(ps[0]['out_start'])} | {text[:90] + ('...' if len(text) > 90 else '')} | {note} |")
+    light = "; ".join(f"{c}: {name} (brightness {l:.0f})" for c, (name, l) in lights.items())
+    md = (f"**Length:** {mmss(total)}, phrases kept {mmss(raw_len)}\n\n**Light:** {light}\n\n"
+          "| At | Line | Pauses |\n|---|---|---|\n" + "\n".join(rows) + "\n")
+    (OUT / "storyboard.md").write_text(md)
+    print("\n" + md)
 
 
 def cmd_render(a):
@@ -403,23 +513,35 @@ def cmd_render(a):
     seg_dir.mkdir(parents=True)
     OUT.mkdir(exist_ok=True)
 
-    max_sil = a.max_silence if a.max_silence is not None else plan.get("max_silence", 0.45)
+    max_sil = a.max_silence if a.max_silence is not None else plan.get("max_silence", 0.40)
     pieces = []
     for s in plan["segments"]:
         src = INPUT / s["clip"]
-        subs = tighten(src, s["start"], s["end"], max_sil, 0.15) if max_sil > 0 else [(s["start"], s["end"])]
+        subs = (tighten(src, s["start"], s["end"], max_sil, 0.10, 0.08, words_by_clip.get(s["clip"], []))
+                if max_sil > 0 else [(s["start"], s["end"])])
         for j, (st, en) in enumerate(subs):
-            pieces.append({"clip": s["clip"], "start": st, "end": en, "new_phrase": j == 0})
+            pieces.append({"clip": s["clip"], "start": st, "end": en, "new_phrase": j == 0, "seg": s})
     before = sum(s["end"] - s["start"] for s in plan["segments"])
     after = sum(p["end"] - p["start"] for p in pieces)
     print(f"pause removal: {len(plan['segments'])} phrases -> {len(pieces)} pieces, {before:.1f}s -> {after:.1f}s")
+
+    # exposure: "light" in edit.json may be "auto" (default), one preset for all clips, or {clip: preset}
+    light_cfg = plan.get("light", "auto")
+    lights = {}
+    for clip in dict.fromkeys(p["clip"] for p in pieces):
+        want = light_cfg.get(clip, "auto") if isinstance(light_cfg, dict) else light_cfg
+        luma = measure_luma(INPUT / clip, [(p["start"], p["end"]) for p in pieces if p["clip"] == clip][:12])
+        lights[clip] = (pick_light(luma) if want == "auto" else want, luma)
+        if lights[clip][0] not in LIGHT:
+            sys.exit(f"unknown light setting {lights[clip][0]}; use auto or one of {', '.join(LIGHT)}")
+        print(f"light: {clip}: brightness {luma:.0f} -> {lights[clip][0]}")
 
     timeline_words, offset, parts = [], 0.0, []
     filters = {}
     for i, s in enumerate(pieces):
         src = INPUT / s["clip"]
         if src not in filters:
-            filters[src] = video_filter(src)
+            filters[src] = video_filter(src, lights[s["clip"]][0])
         dur = s["end"] - s["start"]
         part = seg_dir / f"{i:03d}.mp4"
         run(["ffmpeg", "-y", "-v", "error", "-ss", f"{s['start']:.3f}", "-i", src, "-t", f"{dur:.3f}",
@@ -428,6 +550,7 @@ def cmd_render(a):
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-c:a", "pcm_s16le", "-ar", "48000",
              "-video_track_timescale", "30000", part.with_suffix(".mov")])
         parts.append(part.with_suffix(".mov"))
+        s["out_start"] = offset
         first = s["new_phrase"]
         for w in words_by_clip.get(s["clip"], []):
             mid = (w["start"] + w["end"]) / 2
@@ -449,6 +572,8 @@ def cmd_render(a):
         left = silences(joined, max_sil + 0.05, thr)
         print(f"pause check: {len(left)} pauses over {max_sil + 0.05:.2f}s left" +
               (": " + ", ".join(f"{a0:.1f}s ({a1 - a0:.2f}s)" for a0, a1 in left) if left else ""))
+
+    write_storyboard(plan, pieces, lights, offset, before, words_by_clip)
 
     ass, srt = build_captions(timeline_words, style, plan.get("hook", ""), plan.get("hook_seconds", 3))
     (WORK / "captions.ass").write_text(ass)
@@ -508,7 +633,7 @@ def main():
     r = sub.add_parser("render"); add_render(r)
     r.add_argument("--style", default="", choices=[""] + list(STYLES))
     r.add_argument("--max-silence", type=float, default=None,
-                   help="shorten pauses longer than this many seconds to a ~0.3s beat (default 0.45; 0 = off)")
+                   help="shorten pauses longer than this many seconds to a ~0.3s beat (default 0.40; 0 = off)")
     r.add_argument("--keep-fillers", dest="drop_fillers", action="store_false")
     r.set_defaults(fn=cmd_render)
 

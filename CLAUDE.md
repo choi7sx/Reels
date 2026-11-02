@@ -35,15 +35,22 @@ themselves. Do every step for them, and send the finished video back with SendUs
 5. **Render**: `python3 reel.py render` → `out/reel.mp4` (**clean: no captions or hook burned in,
    which is what the user wants by default**) + `out/captions.srt`. Add `--captions` only if the user
    asks for burned-in captions on a specific reel.
-   Render measures the real audio and shortens only long gaps between sentences (silence or
-   breathing over 0.45s) to a natural ~0.3s beat (`--max-silence`, or `"max_silence"` in edit.json; 0 = off). It prints a `pause check`
-   line. The user wants long dead air gone but NOT choppy cuts. Don't cut breaths or short pauses;
-   that clipped words when tried.
+   **Pause cutting (the user's top priority: no dead air, but never clipped words).** Render
+   shortens every pause over 0.40s (`--max-silence`) to a ~0.2s beat and trims phrase edges, so
+   joins between phrases are one natural beat. A frame counts as silence only if it's >25 dB
+   under speech, or 15–25 dB under AND the VAD hears no speech. 30ms+ within 20 dB of speech is
+   never cut (soft words). Edges inside a word that's mostly outside a hand-picked range are
+   dropped, not kept as fragments. Check the `pause check` line, and only hand-trim a pause if
+   it's clearly dead air; leave hesitations and breaths alone.
+   **Light:** each clip's brightness is measured and one of `LIGHT` is applied automatically
+   (none / brighten / brighten_more / darken / darken_more). Override with `"light"` in edit.json
+   (one preset or `{clip: preset}`).
 6. **Check**: grab 2–3 frames (`ffmpeg -ss 2 -i out/reel.mp4 -frames:v 1 -vf scale=360:-1 work/f.png`)
    and look at them for framing (and, with `--captions`, that captions don't cover the face).
 7. **Deliver**: SendUserFile only `out/reel.mp4` (the clean version). They add captions in
    Edits/CapCut themselves. Still suggest a hook line in the chat message so they can type it in.
-   Summarise in 2–3 lines what you cut. Revisions: edit `work/edit.json` and run `render` again.
+   Paste `out/storyboard.md` (kept lines, pauses shortened, light setting) into the chat as the
+   storyboard, plus a 1–2 line summary of retakes and lines you cut. Revisions: edit `work/edit.json` and run `render` again.
    You don't need to transcribe again.
 
 ## Caption styles (`--style`)
