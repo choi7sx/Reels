@@ -338,7 +338,8 @@ _silence_cache = {}
 def silences(src, min_len, thr=None):
     """Silent stretches in a clip, measured from the audio itself (not Whisper's timings).
 
-    Threshold adapts to the recording: 12 dB under typical speech level, so breaths count as pauses."""
+    Threshold adapts to the recording: 15 dB under typical speech, so breathy gaps between
+    sentences count, but soft word endings don't."""
     import numpy as np
     key = (src, thr)
     if key not in _silence_cache:
@@ -350,20 +351,11 @@ def silences(src, min_len, thr=None):
         # smooth over 50 ms so single quiet frames inside words don't count as silence
         db = np.convolve(db, np.ones(5) / 5, mode="same")
         floor, speech = np.percentile(db, 10), np.percentile(db, 90)
-        # anything ~12 dB below normal speech (breaths, room tone, lip noise) counts as a pause
         if thr is None:
-            thr = max(floor + 6.0, speech - 12.0)
+            thr = max(floor + 6.0, speech - 15.0)
         _silence_cache[("thr", src)] = thr
+        _silence_cache[("db", src)] = (db, speech)
         quiet = db < thr
-        # a blip under 100 ms between two quiet stretches (click, breath, bump) is still a pause
-        loud_start = None
-        for i in range(len(quiet)):
-            if not quiet[i] and loud_start is None:
-                loud_start = i
-            elif quiet[i] and loud_start is not None:
-                if i - loud_start <= 10 and loud_start > 0 and quiet[loud_start - 1]:
-                    quiet[loud_start:i] = True
-                loud_start = None
         runs, start = [], None
         for i, q in enumerate(np.append(quiet, False)):
             if q and start is None:
@@ -388,6 +380,9 @@ def tighten(src, start, end, max_sil, pad):
         if s1 >= end:            # segment ends in silence: move the end
             end = cut_from
             break
+        db, speech = _silence_cache[("db", src)]
+        if db[int(cut_from * 100):int(cut_to * 100)].max(initial=-200) > speech - 20:
+            continue  # something audible (soft word ending) inside: leave this pause alone
         if cut_to - cut_from > 0.05:
             pieces.append((cur, cut_from))
             cur = cut_to
@@ -408,11 +403,11 @@ def cmd_render(a):
     seg_dir.mkdir(parents=True)
     OUT.mkdir(exist_ok=True)
 
-    max_sil = a.max_silence if a.max_silence is not None else plan.get("max_silence", 0.25)
+    max_sil = a.max_silence if a.max_silence is not None else plan.get("max_silence", 0.45)
     pieces = []
     for s in plan["segments"]:
         src = INPUT / s["clip"]
-        subs = tighten(src, s["start"], s["end"], max_sil, 0.06) if max_sil > 0 else [(s["start"], s["end"])]
+        subs = tighten(src, s["start"], s["end"], max_sil, 0.15) if max_sil > 0 else [(s["start"], s["end"])]
         for j, (st, en) in enumerate(subs):
             pieces.append({"clip": s["clip"], "start": st, "end": en, "new_phrase": j == 0})
     before = sum(s["end"] - s["start"] for s in plan["segments"])
@@ -512,7 +507,7 @@ def main():
     r = sub.add_parser("render"); add_render(r)
     r.add_argument("--style", default="", choices=[""] + list(STYLES))
     r.add_argument("--max-silence", type=float, default=None,
-                   help="cut every pause longer than this many seconds (default 0.25; 0 = off)")
+                   help="shorten pauses longer than this many seconds to a ~0.3s beat (default 0.45; 0 = off)")
     r.add_argument("--keep-fillers", dest="drop_fillers", action="store_false")
     r.set_defaults(fn=cmd_render)
 
