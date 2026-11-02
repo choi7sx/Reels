@@ -22,7 +22,11 @@ themselves. Do every step for them, and send the finished video back with SendUs
    - Delete false starts, "wait let me redo that", and off-script chatter.
    - Keep the strongest line first as the hook. Aim for 15–45 seconds total.
    - If the user gave no hook, write a punchy one of 3 to 7 words from the content.
-   - You can trim `start`/`end` and reorder segments.
+   - You can trim `start`/`end` and reorder segments. If a retake is inside one phrase
+     ("...for me. Wait, let me redo that."), move `start`/`end` using the word times in
+     `work/transcript.json`, or drop the phrase.
+   - Fix misheard words (names, slang, brand names) by editing the `"w"` values in
+     `work/transcript.json`. Captions are built from those words.
 5. **Render**: `python3 reel.py render` → `out/reel.mp4` + `out/captions.srt`.
 6. **Check**: grab 2–3 frames (`ffmpeg -ss 2 -i out/reel.mp4 -frames:v 1 -vf scale=360:-1 work/f.png`)
    and look at them to make sure captions aren't covering the face and aren't off-screen.

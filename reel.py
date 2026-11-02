@@ -104,6 +104,16 @@ def cmd_fetch(a):
 
 
 # ---------------------------------------------------------------- transcribe
+def load_audio(path):
+    """Decode to 16 kHz mono float32 with ffmpeg (avoids PyAV version issues)."""
+    import numpy as np
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000",
+                        "-f", "f32le", "-"], capture_output=True)
+    if r.returncode != 0:
+        sys.exit(f"could not read audio from {path.name}: {r.stderr.decode()[-500:]}")
+    return np.frombuffer(r.stdout, dtype=np.float32)
+
+
 def cmd_transcribe(a):
     try:
         from faster_whisper import WhisperModel
@@ -119,7 +129,7 @@ def cmd_transcribe(a):
     out = {"model": a.model, "clips": []}
     for f in clips():
         print(f"transcribing {f.name} ...")
-        segs, info = model.transcribe(str(f), word_timestamps=True, vad_filter=False,
+        segs, info = model.transcribe(load_audio(f), word_timestamps=True, vad_filter=False,
                                       language=a.language, condition_on_previous_text=False)
         words = []
         for s in segs:
