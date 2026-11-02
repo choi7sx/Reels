@@ -24,7 +24,9 @@ themselves. Do every step for them, and send the finished video back with SendUs
      others from `edit.json` `segments`.
    - Delete false starts, "wait let me redo that", and off-script chatter.
    - Keep the strongest line first as the hook. Aim for 15–45 seconds total.
-   - If the user gave no hook, write a punchy one of 3 to 7 words from the content.
+   - If the user gave no hook, write one of 3 to 7 words from the content, chosen to keep the most
+     viewers watching: open a curiosity loop the video pays off, and keep it true to what's said.
+     Don't run it through brand-voice or copy guides unless the user asks.
    - You can trim `start`/`end` and reorder segments. If a retake is inside one phrase
      ("...for me. Wait, let me redo that."), move `start`/`end` using the word times in
      `work/transcript.json`, or drop the phrase.
