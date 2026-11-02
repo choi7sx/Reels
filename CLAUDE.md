@@ -32,14 +32,17 @@ themselves. Do every step for them, and send the finished video back with SendUs
      `work/transcript.json`, or drop the phrase.
    - Fix misheard words (names, slang, brand names) by editing the `"w"` values in
      `work/transcript.json`. Captions are built from those words.
-5. **Render**: `python3 reel.py render` → `out/reel.mp4` + `out/captions.srt`.
+5. **Render**: `python3 reel.py render` → `out/reel.mp4` (**clean: no captions or hook burned in,
+   which is what the user wants by default**) + `out/captions.srt`. Add `--captions` only if the user
+   asks for burned-in captions on a specific reel.
    Render measures the real audio and shortens only long gaps between sentences (silence or
    breathing over 0.45s) to a natural ~0.3s beat (`--max-silence`, or `"max_silence"` in edit.json; 0 = off). It prints a `pause check`
    line. The user wants long dead air gone but NOT choppy cuts. Don't cut breaths or short pauses;
    that clipped words when tried.
 6. **Check**: grab 2–3 frames (`ffmpeg -ss 2 -i out/reel.mp4 -frames:v 1 -vf scale=360:-1 work/f.png`)
-   and look at them to make sure captions aren't covering the face and aren't off-screen.
-7. **Deliver**: SendUserFile `out/reel.mp4`, and `out/captions.srt` if they use CapCut.
+   and look at them for framing (and, with `--captions`, that captions don't cover the face).
+7. **Deliver**: SendUserFile only `out/reel.mp4` (the clean version). They add captions in
+   Edits/CapCut themselves. Still suggest a hook line in the chat message so they can type it in.
    Summarise in 2–3 lines what you cut. Revisions: edit `work/edit.json` and run `render` again.
    You don't need to transcribe again.
 
@@ -50,8 +53,7 @@ themselves. Do every step for them, and send the finished video back with SendUs
 Positions, sizes and colours are defined in `STYLES` in `reel.py`.
 
 ## CapCut handoff
-`python3 reel.py render --no-captions -o reel_clean.mp4` gives a clean cut. In CapCut,
-import it together with `out/captions.srt`. The audio is already loudness-normalised to −14 LUFS.
+The default render is already clean. In CapCut desktop you can import `out/captions.srt`. The audio is already loudness-normalised to −14 LUFS.
 
 ## Notes
 - iPhone HDR footage is tone-mapped to SDR automatically (otherwise it looks washed out on IG).

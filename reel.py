@@ -459,7 +459,7 @@ def cmd_render(a):
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", joined]
     if music:
         cmd += ["-stream_loop", "-1", "-i", INPUT / music]
-    vf = "null" if a.no_captions else f"ass={WORK/'captions.ass'}:fontsdir={FONTS}"
+    vf = f"ass={WORK/'captions.ass'}:fontsdir={FONTS}" if a.captions else "null"
     voice = "[0:a]highpass=f=80,acompressor=threshold=-20dB:ratio=3:attack=5:release=120[v]"
     if music:
         af = (f"{voice};[v]asplit[v1][v2];[1:a]volume={plan.get('music_volume', 0.12)}[m];"
@@ -499,7 +499,8 @@ def main():
         sp.add_argument("--keep-fillers", dest="drop_fillers", action="store_false")
 
     def add_render(sp):
-        sp.add_argument("--no-captions", action="store_true", help="clean video (add captions in CapCut with captions.srt)")
+        sp.add_argument("--captions", action="store_true",
+                        help="burn captions + hook title into the video (default: clean video, captions only in captions.srt)")
         sp.add_argument("-o", "--output", default="")
 
     t = sub.add_parser("transcribe"); add_transcribe(t); t.set_defaults(fn=cmd_transcribe)
