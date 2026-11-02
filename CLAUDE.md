@@ -9,6 +9,9 @@ themselves. Do every step for them, and send the finished video back with SendUs
 1. **Setup**: run `./setup.sh` once per session. If it says the Whisper model download
    is blocked, tell the user to allow `huggingface.co` in the environment's network settings.
 2. **Get clips** into `input/` (files are used in name order):
+   - **iCloud (fastest from an iPhone)**: Photos → select clips → Share → *Create Shared Album
+     Link* → paste. `python3 reel.py fetch https://photos.icloud.com/shared/album/<id>` pulls the
+     full-quality (edited, if trimmed in Photos) version of every video in the album, in order.
    - Share links (Google Drive set to "Anyone with the link", Dropbox, direct URLs):
      `python3 reel.py fetch <url> <url> ...`
    - Videos the user attached in the app: `python3 reel.py fetch /root/.claude/uploads/<session-id>/`

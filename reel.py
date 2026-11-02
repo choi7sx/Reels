@@ -80,10 +80,69 @@ def direct_url(url):
     return url
 
 
+CK = "https://ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production"
+
+
+def ck_post(url, body):
+    import urllib.request
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers={
+        "Content-Type": "text/plain", "Origin": "https://photos.icloud.com", "Referer": "https://photos.icloud.com/"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def icloud_videos(url):
+    """Resolve an iPhone 'Create Shared Album Link' URL into [(filename, download_url)].
+
+    Uses the same public CloudKit calls the photos.icloud.com web page makes. Prefers the
+    edited version of a clip (what you see in Photos) over the untouched original."""
+    import base64
+    key = re.search(r"/shared/album/([\w-]+)", url).group(1)
+    res = ck_post(f"{CK}/public/records/resolve?remapEnums=true&sharing_url_key={key}",
+                  {"shortGUIDs": [{"value": key}]})["results"][0]
+    acc, zone = res["anonymousPublicAccess"], res["zoneID"]
+    base = acc["databasePartition"].rstrip("/") + "/database/1/com.apple.photos.cloud/production/shared"
+    qs = f"remapEnums=true&sharing_url_key={key}&publicAccessAuthToken={urllib.parse.quote(acc['token'])}"
+    assets, masters, rank = [], {}, 0
+    while True:
+        recs = ck_post(f"{base}/records/query?{qs}", {
+            "query": {"recordType": "CPLAssetAndMasterByAddedDate", "filterBy": [
+                {"fieldName": "direction", "comparator": "EQUALS", "fieldValue": {"value": "ASCENDING", "type": "STRING"}},
+                {"fieldName": "startRank", "comparator": "EQUALS", "fieldValue": {"value": rank, "type": "INT64"}}]},
+            "zoneID": zone, "resultsLimit": 200}).get("records", [])
+        new = [r for r in recs if r.get("recordType") == "CPLAsset"]
+        assets += new
+        masters.update({r["recordName"]: r for r in recs if r.get("recordType") == "CPLMaster"})
+        if not new or len(recs) < 200:
+            break
+        rank += len(new)
+    out = []
+    for i, a in enumerate(assets):
+        af = a["fields"]
+        m = masters.get(af.get("masterRef", {}).get("value", {}).get("recordName"), {}).get("fields", {})
+        res_ = af.get("resVidFullRes") or m.get("resOriginalRes")
+        ftype = (af.get("resVidFullFileType") if "resVidFullRes" in af else m.get("resOriginalFileType", {})) or {}
+        if not res_ or "movie" not in ftype.get("value", "") and "mpeg-4" not in ftype.get("value", ""):
+            continue  # a photo, not a video
+        name = base64.b64decode(m["filenameEnc"]["value"]).decode() if "filenameEnc" in m else f"icloud{i + 1:02d}.mov"
+        name = f"{i + 1:02d}_{Path(name).stem}{'.mov' if 'quicktime' in ftype.get('value', '') else '.mp4'}"
+        out.append((name, res_["value"]["downloadURL"].replace("${f}", urllib.parse.quote(name))))
+    if not out:
+        sys.exit("No videos found in that iCloud link.")
+    return out
+
+
 def cmd_fetch(a):
     INPUT.mkdir(exist_ok=True)
     n = len(list(INPUT.iterdir()))
     for src in a.sources:
+        if "icloud.com/shared/album/" in src:
+            for name, dl in icloud_videos(src):
+                print(f"iCloud: {name}")
+                run(["curl", "-fL", "--retry", "3", "-sS", "-o", INPUT / name, dl])
+            continue
+        if "icloud.com" in src:
+            sys.exit("Only iCloud *shared album* links work (Photos > Share > Create Shared Album Link).")
         if src.startswith(("http://", "https://")):
             n += 1
             tmp = INPUT / f"clip{n:02d}.download"
