@@ -404,6 +404,7 @@ def silences(src, min_len, thr=None):
             thr = max(floor + 6.0, speech - 15.0)
         _silence_cache[("thr", src)] = thr
         _silence_cache[("db", src)] = (db, speech)
+        _silence_cache[("raw", src)] = raw
         # very quiet (>25 dB under speech) is silence even if the VAD's hangover still says "speech";
         # the 15-25 dB band (where soft word endings live) only counts if the VAD agrees.
         quiet = (db < speech - 25.0) | ((db < thr) & ~speech_mask(src, x, n))
@@ -451,13 +452,9 @@ def tighten(src, start, end, max_sil, pad_after, pad_before, words=()):
     for s0, s1 in silences(src, max_sil):
         if s1 <= cur or s0 >= end:
             continue
+        # inside measured silence the audio is trusted over Whisper's loose word times; the
+        # never-cut-near-speech rule in silences() already protects soft words
         cut_from, cut_to = max(cur, s0 + pad_after), min(end, s1 - pad_before)
-        for c0, c1 in cores:  # pull the cut back out of any word it would touch
-            if c0 < cut_to and c1 > cut_from:
-                if c0 - cut_from > cut_to - c1:
-                    cut_to = c0
-                else:
-                    cut_from = c1
         if cut_to - cut_from < 0.1:
             continue
         if s0 <= cur:            # segment starts in silence: just move the start
@@ -471,7 +468,20 @@ def tighten(src, start, end, max_sil, pad_after, pad_before, words=()):
         cur = cut_to
     if end - cur > 0.08:
         pieces.append((cur, end))
-    return [p for p in pieces if p[1] - p[0] > 0.08]
+    # Final pass: each piece starts just before its first audible frame (within 20 dB of speech)
+    # and ends just after its last one; pieces with nothing audible are dropped. Catches silence the
+    # VAD's hangover protected and words Whisper imagined.
+    _, speech = _silence_cache[("db", src)]
+    raw = _silence_cache[("raw", src)]  # unsmoothed, so word onsets aren't detected late
+    out = []
+    for a, b in pieces:
+        idx = [i for i in range(int(a * 100), min(len(raw), int(b * 100))) if raw[i] > speech - 20]
+        if not idx:
+            continue
+        a2, b2 = max(a, idx[0] / 100 - pad_before), min(b, idx[-1] / 100 + pad_after + 0.02)
+        if b2 - a2 > 0.08:
+            out.append((a2, b2))
+    return out
 
 
 def write_storyboard(plan, pieces, lights, total, raw_len, words_by_clip):
@@ -513,7 +523,7 @@ def cmd_render(a):
     seg_dir.mkdir(parents=True)
     OUT.mkdir(exist_ok=True)
 
-    max_sil = a.max_silence if a.max_silence is not None else plan.get("max_silence", 0.40)
+    max_sil = a.max_silence if a.max_silence is not None else plan.get("max_silence", 0.35)
     pieces = []
     for s in plan["segments"]:
         src = INPUT / s["clip"]
@@ -633,7 +643,7 @@ def main():
     r = sub.add_parser("render"); add_render(r)
     r.add_argument("--style", default="", choices=[""] + list(STYLES))
     r.add_argument("--max-silence", type=float, default=None,
-                   help="shorten pauses longer than this many seconds to a ~0.3s beat (default 0.40; 0 = off)")
+                   help="shorten pauses longer than this many seconds to a ~0.3s beat (default 0.35; 0 = off)")
     r.add_argument("--keep-fillers", dest="drop_fillers", action="store_false")
     r.set_defaults(fn=cmd_render)
 

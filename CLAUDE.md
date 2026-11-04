@@ -36,7 +36,7 @@ themselves. Do every step for them, and send the finished video back with SendUs
    which is what the user wants by default**) + `out/captions.srt`. Add `--captions` only if the user
    asks for burned-in captions on a specific reel.
    **Pause cutting (the user's top priority: no dead air, but never clipped words).** Render
-   shortens every pause over 0.40s (`--max-silence`) to a ~0.2s beat and trims phrase edges, so
+   shortens every pause over 0.35s (`--max-silence`) to a ~0.2s beat and trims phrase edges, so
    joins between phrases are one natural beat. A frame counts as silence only if it's >25 dB
    under speech, or 15–25 dB under AND the VAD hears no speech. 30ms+ within 20 dB of speech is
    never cut (soft words). Edges inside a word that's mostly outside a hand-picked range are
